@@ -1,0 +1,30 @@
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.0
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - "JDK_JAVA_OPTIONS=-XX:-UseContainerSupport"
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    networks:
+      - elk-network
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:7.17.0
+    container_name: kibana
+    environment:
+      # Sửa cổng kết nối từ 9300 (transport) về đúng cổng 9200 (HTTP REST API)
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    depends_on:
+      - elasticsearch
+    networks:
+      - elk-network
+
+networks:
+  elk-network:
+    driver: bridge
