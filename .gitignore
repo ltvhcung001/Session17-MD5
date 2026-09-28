@@ -12,3 +12,4 @@ Desktop.ini
 
 # Temporary data & Logs
 *.log
+!logs/storex.log

@@ -1,0 +1,21 @@
+filebeat.inputs:
+  - type: log
+    enabled: true
+    paths:
+      - /var/log/storex/storex.log
+      - /var/log/storex/*.log
+    # Tự động parse chuỗi JSON thành các trường có cấu trúc trên Elasticsearch
+    json.keys_under_root: true
+    json.overwrite_keys: true
+    json.add_error_key: true
+
+setup.template.settings:
+  index.number_of_shards: 1
+
+output.elasticsearch:
+  hosts: ["http://elasticsearch:9200"]
+  index: "storex-filebeat-%{+yyyy.MM.dd}"
+
+setup.template.name: "storex-filebeat"
+setup.template.pattern: "storex-filebeat-*"
+setup.ilm.enabled: false

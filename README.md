@@ -1,253 +1,204 @@
-# BÀI TẬP SESSION 17 (MD5) - BÀI TẬP 4 (HW4)
-## Phân tích và Khắc phục lỗi Lost Log & Nghẽn Hệ thống khi Logstash Quá tải (AsyncAppender Pattern)
+# BÀI TẬP SESSION 17 (MD5) - BÀI TẬP 5 (HW5)
+## Triển khai Filebeat thay vì Logstash TCP: Tối ưu hóa tài nguyên & Cách ly Ứng dụng (Sidecar Pattern)
 
 ---
 
 ## 1. Mục tiêu kiến thức & Tình huống nghiệp vụ
 
 - **Mục tiêu kiến thức**:
-  - Hiểu sâu sắc cơ chế hoạt động của cơ chế hàng đợi (**Queue**) và vùng đệm (**Buffer**) trong kiến trúc logging tập trung.
-  - Phân tích được hiệu ứng sập đổ dây chuyền (**Cascading Failure / Thread Starvation**) khi sử dụng Appender truyền dữ liệu qua mạng dạng đồng bộ.
-  - Nắm vững cách cấu hình **`AsyncAppender`** trong Logback / Spring Boot và hiểu bản chất từng thông số kỹ thuật then chốt (`queueSize`, `neverBlock`, `discardingThreshold`).
-  - Nắm được mô hình kiến trúc mở rộng chuẩn Production sử dụng Message Broker (Kafka/RabbitMQ) làm lớp đệm bền vững.
+  - Nắm vững mô hình kiến trúc **Log Shipper** (sử dụng **Filebeat** viết bằng Go) thay thế cho việc ứng dụng bắn log trực tiếp qua mạng Socket TCP.
+  - Hiểu nguyên lý tách biệt hoàn toàn ứng dụng nghiệp vụ khỏi hạ tầng logging (**Decoupling Architecture**): Ứng dụng chỉ ghi log ra file cục bộ trên đĩa, Filebeat đóng vai trò Sidecar âm thầm đọc file và vận chuyển sang Elasticsearch.
+  - Biết cách cấu hình `filebeat.yml` (bóc tách JSON log, cấu hình template và index động) và kết nối với cụm Docker Compose.
 
 - **Tình huống nghiệp vụ**:
-  - Vào sự kiện Flash Sale, hệ thống bán hàng **StoreX** ghi nhận lượng truy cập khổng lồ, phát sinh lưu lượng log lên tới **10.000 dòng log/giây**.
-  - Cụm Logstash tiếp nhận không kịp xử lý dẫn đến nghẽn mạng và chậm phản hồi.
-  - Hệ quả nghiêm trọng: Ứng dụng Backend Spring Boot bị lỗi **Timeout** liên tục, các luồng xử lý đơn hàng bị đóng băng, khách hàng không thể thanh toán, gây gián đoạn và thiệt hại doanh thu trực tiếp cho doanh nghiệp.
+  - Sau bài học từ sự cố sập luồng chính do tắc nghẽn TCP ở HW4, Dev team StoreX quyết định thay đổi hoàn toàn kiến trúc:
+    1. **Spring Boot**: Không phụ thuộc vào bất kỳ kết nối mạng socket nào khi ghi log. Ứng dụng chỉ ghi log ra file trên đĩa (`storex.log`) bằng cơ chế `RollingFileAppender` truyền thống của Logback.
+    2. **Filebeat**: Triển khai agent siêu nhẹ Filebeat cùng mount chung thư mục log (volume). Filebeat tự động đọc dòng log mới (tailing/harvesting) và đẩy trực tiếp vào Elasticsearch một cách an toàn.
 
 ---
 
-## 2. Phân tích nguyên nhân gốc rễ (Root Cause Analysis)
-
-### 2.1. Vì sao Appender TCP đồng bộ lại làm chậm và sập toàn bộ ứng dụng chính?
-
-Cấu hình ban đầu của ứng dụng StoreX:
-```xml
-<appender name="LOGSTASH" class="net.logstash.logback.appender.LogstashTcpSocketAppender">
-    <destination>logstash:5000</destination>
-    <encoder class="net.logstash.logback.encoder.LogstashEncoder" />
-</appender>
-```
+## 2. Phân tích so sánh Kiến trúc: Logstash TCP vs. Filebeat Log Shipper
 
 ```
-           [ CƠ CHẾ NGHẼN CỦA ĐỒNG BỘ: HIỆU ỨNG SẬP DÂY CHUYỀN (THREAD STARVATION) ]
+                       [ MÔ HÌNH SO SÁNH 2 KIẾN TRÚC ]
 
-   Khách hàng gửi Request
-            │
-            ▼
-    ┌────────────────────────────────────────────────────────┐
-    │  TOMCAT THREAD POOL (Giới hạn mặc định: 200 threads)    │
-    │                                                        │
-    │  [Worker Thread 1] ──► Xử lý Đơn hàng                  │
-    │                           │                            │
-    │                           ▼                            │
-    │                     log.info(...)                      │
-    │                           │                            │
-    │                           ▼  (Ghi mạng Socket TCP)     │
-    │                   ┌───────────────┐                    │
-    │                   │ TCP Socket    │                    │
-    │                   │ OS Send Buffer│ ──► [ LOGSTASH ]   │
-    │                   └───────────────┘       (BỊ QUÁ TẢI) │
-    │                           │               (Xử lý chậm) │
-    │                           ▼                            │
-    │             Buffer đầy -> socket.write() BỊ BLOCK      │
-    │             Thread 1 bị TREO vô thời hạn!             │
-    │                                                        │
-    │  [Worker Thread 2] ──► log.info(...) ──► BỊ BLOCK      │
-    │  [Worker Thread 3] ──► log.info(...) ──► BỊ BLOCK      │
-    │  ...                                                   │
-    │  [Worker Thread 200] ─► log.info(...) ──► BỊ BLOCK     │
-    └────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-         CẠN KIỆT TOÀN BỘ WORKER THREAD TRONG THREAD POOL!
-         Hệ thống sập hoàn toàn (504 Gateway Timeout / Drop kết nối)
-         Chỉ vì một dòng lệnh ghi Log!
+   1. KIẾN TRÚC CŨ: LOGSTASH TCP (Rủi ro cao)
+   ┌─────────────┐
+   │ Spring Boot │──(Ghi trực tiếp qua mạng TCP Socket:5000)──► [ LOGSTASH ] ──► [ ELASTICSEARCH ]
+   └─────────────┘  * Mạng chậm / Logstash nghẽn => TREO ỨNG DỤNG!
+  
+   2. KIẾN TRÚC MỚI: FILEBEAT LOG SHIPPER (An toàn tuyệt đối)
+   ┌─────────────┐
+   │ Spring Boot │──(Ghi cục bộ xuống đĩa buffered I/O)──┐
+   └─────────────┘                                        │
+                                                          ▼
+                                                  ┌──────────────┐
+                                                  │  storex.log  │ (Thư mục dùng chung Volume)
+                                                  └──────────────┘
+                                                          ▲
+                                                          │ (Tailing file bất đồng bộ)
+                                                  ┌───────┴──────┐
+                                                  │   FILEBEAT   │ (Agent Go cực nhẹ ~30MB)
+                                                  └───────┬──────┘
+                                                          │ (Push HTTP có cơ chế Backpressure)
+                                                          ▼
+                                                 ┌─────────────────┐
+                                                 │  ELASTICSEARCH  │
+                                                 └─────────────────┘
 ```
 
-### 2.2. Chuỗi sự kiện gây sập hệ thống (Step-by-step Failure Analysis):
-1. **Lưu lượng tăng đột biến**: Vào đợt Sale, hàng ngàn khách hàng thao tác đồng thời tạo ra 10.000 log/s.
-2. **Logstash bị quá tải**: Do tài nguyên CPU, I/O hoặc Elasticsearch ghi chậm, Logstash không kịp đọc dữ liệu từ Socket TCP.
-3. **Tràn bộ đệm TCP (TCP Window Full)**: Bộ đệm socket của hệ điều hành phía máy chủ ứng dụng bị đầy (TCP Zero Window), không thể gửi thêm byte nào qua mạng.
-4. **Luồng chính bị khóa (Thread Blocking)**: Khi gọi `log.info(...)`, luồng xử lý chính (`http-nio-8080-exec-x`) phải đợi phương thức `socket.write()` hoàn tất. Do socket bị nghẽn, luồng này bị treo và chuyển sang trạng thái `BLOCKED` / `WAITING`.
-5. **Cạn kiệt Thread Pool (Thread Pool Exhaustion)**: Web Server (Tomcat) có số lượng thread giới hạn (thường là 200 threads). Từng thread xử lý xong phần logic nghiệp vụ nhưng bị giữ lại ở bước ghi log, dẫn đến toàn bộ 200 threads đều bị treo.
-6. **Sập hệ thống toàn diện**: Các request tiếp theo từ khách hàng không có thread nào phục vụ, dẫn đến lỗi `Connection Refused` hoặc `HTTP 504 Gateway Timeout`.
+### Bảng so sánh kỹ thuật:
 
----
-
-## 3. Giải pháp kỹ thuật: Cơ chế Bất đồng bộ với `AsyncAppender`
-
-### 3.1. Sơ đồ kiến trúc AsyncAppender
-
-```
-             [ KIẾN TRÚC BẤT ĐỒNG BỘ BẢO VỆ LUỒNG CHÍNH (ASYNCAPPENDER) ]
-
-   Khách hàng gửi Request
-            │
-            ▼
-    ┌──────────────────────────────────────────────────────────────┐
-    │  TOMCAT WORKER THREAD                                        │
-    │                                                              │
-    │  1. Xử lý nghiệp vụ thanh toán (Business Logic)              │
-    │  2. log.info(...)                                            │
-    │  3. Đẩy log vào BlockingQueue trong RAM (Chỉ mất vài micro-giây) │
-    │  4. Ngay lập tức giải phóng thread để phục vụ khách khác!    │
-    └──────────────────────────────┬───────────────────────────────┘
-                                   │
-                                   ▼ (Non-blocking enqueue)
-                    ┌──────────────────────────────┐
-                    │     IN-MEMORY RING BUFFER    │
-                    │        (BlockingQueue)       │
-                    │     Dung lượng: 16.384 log   │
-                    └──────────────┬───────────────┘
-                                   │
-                                   ▼ (Background Daemon Thread)
-                    ┌──────────────────────────────┐
-                    │     ASYNC WORKER THREAD      │
-                    │   (Chạy nền ngầm độc lập)   │
-                    │  - Lấy log từ Queue ra       │
-                    │  - Gửi qua TCP tới Logstash  │
-                    └──────────────┬───────────────┘
-                                   │
-                                   ▼ (TCP Socket: 5000)
-                            [ LOGSTASH : 5000 ]
-```
-
-### 3.2. Phân tích chi tiết các thuộc tính cốt lõi của `AsyncAppender`
-
-| Thuộc tính | Giá trị tối ưu | Ý nghĩa kỹ thuật & Tác động thực tế |
+| Tiêu chí | Logstash TCP (Kiến trúc cũ) | Filebeat Log Shipper (Kiến trúc chuẩn) |
 | :--- | :--- | :--- |
-| **`queueSize`** | `16384` hoặc `65536` | Kích thước hàng đợi trong bộ nhớ RAM (mặc định là `256`). Với 10.000 log/s, giá trị 256 sẽ bị đầy trong chưa đầy 0.03 giây. Tăng lên 16384 hoặc 65536 tạo ra vùng đệm đủ lớn để ứng phó với các đợt lưu lượng tăng vọt (traffic spikes). |
-| **`neverBlock`** | **`true`** | **THUỘC TÍNH QUAN TRỌNG NHẤT**: Mặc định là `false` (nghĩa là khi hàng đợi đầy, Worker Thread vẫn sẽ bị BLOCK). Khi cấu hình `neverBlock=true`, nếu hàng đợi bị đầy, Logback sẽ tự động vứt bỏ (DROP) log mới thay vì bắt luồng chính phải chờ. **Quy tắc vàng: Thà mất một vài dòng log chứ tuyệt đối không để sập hệ thống bán hàng.** |
-| **`discardingThreshold`** | `20` | Ngưỡng dung lượng hàng đợi còn trống để bắt đầu loại bỏ log (tính theo %). Khi dung lượng trống < 20%, hệ thống tự động loại bỏ các log mức thấp (`TRACE`, `DEBUG`, `INFO`) để ưu tiên giữ lại các log nghiêm trọng (`WARN`, `ERROR`). |
-| **`includeCallerData`** | `false` | Mặc định là `false`. Tuyệt đối không bật `true` trên môi trường tải cao vì việc trích xuất thông tin Class/Method/Line Number đòi hỏi chi phí StackTrace Inspection rất đắt đỏ về CPU. |
-| **`maxFlushTime`** | `5000` | Thời gian tối đa (ms) cho phép background thread tiếp tục xả hết log còn tồn đọng trong hàng đợi khi ứng dụng tắt (Graceful Shutdown). |
+| **Ngôn ngữ phát triển** | Java / JRuby (Chạy trên máy ảo JVM) | Go (Biên dịch trực tiếp ra mã máy native binary) |
+| **Tài nguyên tiêu thụ** | Nặng: Chiếm từ **500MB đến 1GB+ RAM**, tốn nhiều CPU | Siêu nhẹ: Chỉ tiêu thụ khoảng **20MB - 50MB RAM**, CPU gần như bằng 0 |
+| **Tác động đến Ứng dụng** | **Rất nguy hiểm**: Có thể làm block Worker Thread khi mạng chập chờn hoặc buffer socket đầy | **An toàn tuyệt đối**: Ứng dụng chỉ ghi file đĩa cục bộ, hoàn toàn không biết tới sự tồn tại của EFK |
+| **Cơ chế chống mất dữ liệu** | Log trong RAM socket dễ mất khi server crash hoặc restart | **Bền vững (Registry Offset)**: Filebeat ghi nhớ vị trí con trỏ đọc trên đĩa. Nếu Elasticsearch downtime, Filebeat dừng lại và tiếp tục gửi tiếp khi ES online |
+| **Khả năng điều tiết (Backpressure)** | Kém hơn, dễ gây nghẽn tầng socket ứng dụng | Rất mạnh: Tự động điều chỉnh tốc độ đọc file theo đúng khả năng tiếp nhận của Elasticsearch |
 
 ---
 
-## 4. File cấu hình hoàn chỉnh (`logback-spring.xml`)
+## 3. Cấu hình chi tiết
 
-File cấu hình chi tiết đặt tại `src/main/resources/logback-spring.xml`:
+### 3.1. File cấu hình Filebeat (`filebeat.yml`)
 
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<configuration scan="true" scanPeriod="30 seconds">
+Cấu hình đọc file `storex.log` trong volume chia sẻ, tự động bóc tách các trường JSON lên root level và gửi trực tiếp sang Elasticsearch:
 
-    <!-- Cấu hình tên ứng dụng -->
-    <springProperty scope="context" name="appName" source="spring.application.name" defaultValue="storex-service"/>
+```yaml
+filebeat.inputs:
+  - type: log
+    enabled: true
+    paths:
+      - /var/log/storex/storex.log
+      - /var/log/storex/*.log
+    # Tự động parse chuỗi JSON thành các trường có cấu trúc trên Elasticsearch
+    json.keys_under_root: true
+    json.overwrite_keys: true
+    json.add_error_key: true
 
-    <!-- 1. Console Appender hiển thị log cục bộ -->
-    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
-        <encoder>
-            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
-            <charset>UTF-8</charset>
-        </encoder>
-    </appender>
+setup.template.settings:
+  index.number_of_shards: 1
 
-    <!-- 2. TCP Appender gửi log sang Logstash -->
-    <appender name="LOGSTASH" class="net.logstash.logback.appender.LogstashTcpSocketAppender">
-        <destination>logstash:5000</destination>
-        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
-            <customFields>{"app_name":"${appName}"}</customFields>
-        </encoder>
-        <connectionStrategy>
-            <roundRobin>
-                <connectionTimeout>5000</connectionTimeout>
-            </roundRobin>
-        </connectionStrategy>
-    </appender>
+output.elasticsearch:
+  hosts: ["http://elasticsearch:9200"]
+  index: "storex-filebeat-%{+yyyy.MM.dd}"
 
-    <!-- 3. AsyncAppender: Giải pháp xử lý bất đồng bộ chống nghẽn luồng chính -->
-    <appender name="ASYNC_LOGSTASH" class="ch.qos.logback.classic.AsyncAppender">
-        <!-- Tham chiếu tới Logstash TCP Appender -->
-        <appender-ref ref="LOGSTASH" />
+setup.template.name: "storex-filebeat"
+setup.template.pattern: "storex-filebeat-*"
+setup.ilm.enabled: false
+```
 
-        <!-- 
-            Dung lượng hàng đợi đệm (Queue Size):
-            Mặc định là 256. Với lưu lượng cao (10.000 logs/s), cần tăng kích thước hàng đợi
-            để có đủ không gian đệm khi Logstash gặp độ trễ (ví dụ: 16384 hoặc 65536).
-        -->
-        <queueSize>16384</queueSize>
+### 3.2. Cấu hình Docker Compose (`docker-compose.yml`)
 
-        <!-- 
-            Ngưỡng loại bỏ log (Discarding Threshold):
-            Mặc định là 20. Khi hàng đợi chỉ còn trống dưới 20%, Logback sẽ tự động bỏ qua
-            các log mức thấp (TRACE, DEBUG, INFO) để nhường hàng đợi cho log quan trọng (WARN, ERROR).
-        -->
-        <discardingThreshold>20</discardingThreshold>
+Khai báo service `filebeat` chạy cùng mạng `elk-network` và mount chung thư mục log `./logs`:
 
-        <!-- 
-            neverBlock: THUỘC TÍNH CỐT LÕI ĐỂ KHÔNG BLOCK ỨNG DỤNG CHÍNH
-            - true: Khi hàng đợi bị đầy (buffer full), drop log ngay lập tức và trả quyền điều khiển 
-                    lại cho Worker Thread (Non-blocking). Ứng dụng chính tiếp tục chạy bình thường.
-            - false (mặc định): Luồng Worker Thread bị TREO (BLOCK) chờ hàng đợi có chỗ trống,
-                    khiến toàn bộ luồng xử lý đơn hàng bị đóng băng khi Logstash nghẽn.
-        -->
-        <neverBlock>true</neverBlock>
+```yaml
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.0
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - "JDK_JAVA_OPTIONS=-XX:-UseContainerSupport"
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    networks:
+      - elk-network
 
-        <!-- Thời gian tối đa (ms) chờ đẩy hết log trong queue khi ứng dụng dừng (Graceful Shutdown) -->
-        <maxFlushTime>5000</maxFlushTime>
+  logstash:
+    image: docker.elastic.co/logstash/logstash:7.17.0
+    container_name: logstash
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./logstash.conf:/usr/share/logstash/pipeline/logstash.conf:ro
+    environment:
+      - "LS_JAVA_OPTS=-Xms512m -Xmx512m"
+      - "JDK_JAVA_OPTIONS=-XX:-UseContainerSupport"
+    depends_on:
+      - elasticsearch
+    networks:
+      - elk-network
 
-        <!-- Tắt includeCallerData để tăng tốc độ ghi log, tránh tốn CPU cho việc truy vết stacktrace -->
-        <includeCallerData>false</includeCallerData>
-    </appender>
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:7.17.0
+    container_name: filebeat
+    user: root
+    command: ["filebeat", "-e", "--strict.perms=false"]
+    volumes:
+      - ./filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - ./logs:/var/log/storex:ro
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    depends_on:
+      - elasticsearch
+    networks:
+      - elk-network
 
-    <!-- Root Logger sử dụng Appender bất đồng bộ ASYNC_LOGSTASH -->
-    <root level="INFO">
-        <appender-ref ref="CONSOLE" />
-        <appender-ref ref="ASYNC_LOGSTASH" />
-    </root>
+  kibana:
+    image: docker.elastic.co/kibana/kibana:7.17.0
+    container_name: kibana
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    depends_on:
+      - elasticsearch
+    networks:
+      - elk-network
 
-</configuration>
+networks:
+  elk-network:
+    driver: bridge
 ```
 
 ---
 
-## 5. Kiến trúc đệm mở rộng cho hệ thống quy mô lớn (Enterprise Production)
+## 4. Hướng dẫn khởi chạy & Kiểm thử thực tế
 
-Mặc dù `AsyncAppender` với `neverBlock=true` giải quyết triệt để vấn đề nghẽn luồng chính, nhưng việc lưu hàng đợi trong RAM của ứng dụng vẫn có 2 hạn chế:
-1. **Rủi ro mất mát dữ liệu (Data Loss)**: Nếu server bị sập đột ngột (Crash / Out of Memory / Mất điện), số log đang nằm trong RAM chưa kịp gửi sẽ mất vĩnh viễn.
-2. **Giới hạn bộ nhớ RAM**: Nếu hàng đợi quá lớn, ứng dụng sẽ tốn nhiều heap memory và tăng thời gian dừng do Garbage Collection (GC Pause).
-
-### Kiến trúc giải pháp với Message Broker (Kafka Buffer):
-
-```
-                   [ KIẾN TRÚC LOGGING MỞ RỘNG DOANH NGHIỆP ]
-
-   ┌──────────────────┐
-   │ Spring Boot Apps │
-   │  (Microservices) │
-   └────────┬─────────┘
-            │  (Đẩy nhanh qua Kafka Producer)
-            ▼
-   ┌──────────────────────────────────────────────┐
-   │             APACHE KAFKA CLUSTER             │
-   │  - Lớp đệm bền vững ghi trực tiếp xuống đĩa │
-   │  - Khả năng chịu tải hàng trăm nghìn log/s   │
-   │  - Lưu trữ dữ liệu an toàn từ 3 đến 7 ngày   │
-   └──────────────────────┬───────────────────────┘
-                          │
-                          ▼ (Pull theo tốc độ xử lý của Consumer)
-                 ┌──────────────────┐
-                 │ LOGSTASH CLUSTER │
-                 └────────┬─────────┘
-                          │
-                          ▼
-                 ┌──────────────────┐
-                 │  ELASTICSEARCH   │
-                 └──────────────────┘
+### 4.1. Khởi chạy toàn bộ hệ thống
+```bash
+docker compose up -d
 ```
 
-- **Nguyên lý hoạt động**:
-  - Ứng dụng Spring Boot đẩy log vào topic `app-logs` của **Kafka** hoặc **RabbitMQ**.
-  - Kafka đóng vai trò như một **bể chứa đệm khổng lồ (Shock Absorber)**, có khả năng lưu trữ hàng triệu log xuống đĩa an toàn.
-  - Logstash hoạt động với tư cách là Kafka Consumer: chủ động kéo log về theo tốc độ xử lý tối đa của nó. Dù Logstash có bị bảo trì hay chậm trong nhiều giờ, ứng dụng chính vẫn hoạt động trơn tru 100% và không có bất kỳ dòng log nào bị mất mát.
+### 4.2. Ghi log vào file `logs/storex.log`
+Mô phỏng ứng dụng Spring Boot ghi dữ liệu log có cấu trúc xuống file:
+```bash
+echo '{"app":"StoreX","level":"INFO","timestamp":"2026-09-28T10:40:00Z","logger":"com.storex.order.OrderService","orderId":"ORD-5544","amount":320.50,"message":"Order #5544 created successfully via Filebeat"}' >> ./logs/storex.log
+```
+
+### 4.3. Kiểm tra log của container Filebeat
+```bash
+docker logs filebeat --tail 25
+```
+Filebeat lập tức phát hiện file thay đổi, mở harvester và gửi batch dữ liệu sang Elasticsearch với trạng thái phản hồi `200 OK`.
+
+### 4.4. Kiểm tra Index và Document trên Elasticsearch
+1. **Kiểm tra danh sách index**:
+   ```bash
+   curl http://localhost:9200/_cat/indices?v
+   ```
+   *Kết quả*: Xuất hiện index `storex-filebeat-2026.09.28`.
+
+2. **Truy vấn nội dung document**:
+   ```bash
+   curl http://localhost:9200/storex-filebeat-*/_search?pretty
+   ```
+   *Kết quả*: Các trường JSON như `app: StoreX`, `orderId: ORD-5544`, `amount: 320.50`, `message` được lưu trữ đầy đủ dưới dạng structured document.
+
+### 4.5. Trực quan hóa trên giao diện Kibana
+1. Truy cập `http://localhost:5601`.
+2. Vào **Stack Management** > **Index Patterns** > Tạo pattern `storex-filebeat-*`.
+3. Vào tab **Discover** để theo dõi và tìm kiếm log real-time mà ứng dụng StoreX không hề hay biết tới sự tồn tại của EFK.
 
 ---
 
-## 6. Kết luận
+## 5. Kết luận
 
-1. **Nguyên tắc bất di bất dịch trong Thiết kế Hạ tầng**: Tác vụ phụ (như Ghi Log / Metrics / Tracing) **tuyệt đối không bao giờ được phép làm ảnh hưởng hoặc kéo sập luồng xử lý nghiệp vụ chính** của ứng dụng.
-2. Luôn bọc các Network Appender qua **`AsyncAppender`** với thuộc tính **`neverBlock=true`** để đảm bảo tính sẵn sàng cao (**High Availability**) cho toàn hệ thống.
-3. Khi lưu lượng vượt ngưỡng hàng chục nghìn log/s, kiến trúc nên tích hợp thêm **Message Broker (Kafka)** để đảm bảo cả hai tiêu chí: **Không nghẽn ứng dụng** và **Không mất mát log**.
+- Việc chuyển đổi từ Logstash TCP sang **Filebeat Sidecar** là giải pháp chuẩn công nghiệp giúp:
+  1. Bảo vệ ứng dụng chính khỏi mọi nguy cơ tắc nghẽn mạng hoặc sập dây chuyền.
+  2. Tiết kiệm tài nguyên máy chủ nhờ sự gọn nhẹ của Filebeat.
+  3. Đảm bảo tính toàn vẹn dữ liệu log nhờ cơ chế registry offset và backpressure.

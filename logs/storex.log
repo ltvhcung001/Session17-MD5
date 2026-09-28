@@ -1,0 +1,3 @@
+{"app":"StoreX","level":"INFO","timestamp":"2026-09-28T10:40:00Z","logger":"com.storex.order.OrderService","orderId":"ORD-5544","amount":320.50,"message":"Order #5544 created successfully via Filebeat"}
+{"app":"StoreX","level":"WARN","timestamp":"2026-09-28T10:40:05Z","logger":"com.storex.inventory.InventoryService","productId":"PROD-102","stock":3,"message":"Low stock warning for product PROD-102"}
+{"app":"StoreX","level":"INFO","timestamp":"2026-09-28T10:40:10Z","logger":"com.storex.payment.PaymentService","orderId":"ORD-5544","paymentMethod":"VNPAY","message":"Payment completed for order #5544"}
