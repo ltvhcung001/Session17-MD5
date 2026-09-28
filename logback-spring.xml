@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration scan="true" scanPeriod="30 seconds">
+
+    <!-- Cấu hình tên ứng dụng -->
+    <springProperty scope="context" name="appName" source="spring.application.name" defaultValue="storex-service"/>
+
+    <!-- 1. Console Appender hiển thị log cục bộ -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!-- 2. TCP Appender gửi log sang Logstash -->
+    <appender name="LOGSTASH" class="net.logstash.logback.appender.LogstashTcpSocketAppender">
+        <destination>logstash:5000</destination>
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+            <customFields>{"app_name":"${appName}"}</customFields>
+        </encoder>
+        <connectionStrategy>
+            <roundRobin>
+                <connectionTimeout>5000</connectionTimeout>
+            </roundRobin>
+        </connectionStrategy>
+    </appender>
+
+    <!-- 3. AsyncAppender: Giải pháp xử lý bất đồng bộ chống nghẽn luồng chính -->
+    <appender name="ASYNC_LOGSTASH" class="ch.qos.logback.classic.AsyncAppender">
+        <!-- Tham chiếu tới Logstash TCP Appender -->
+        <appender-ref ref="LOGSTASH" />
+
+        <!-- 
+            Dung lượng hàng đợi đệm (Queue Size):
+            Mặc định là 256. Với lưu lượng cao (10.000 logs/s), cần tăng kích thước hàng đợi
+            để có đủ không gian đệm khi Logstash gặp độ trễ (ví dụ: 16384 hoặc 65536).
+        -->
+        <queueSize>16384</queueSize>
+
+        <!-- 
+            Ngưỡng loại bỏ log (Discarding Threshold):
+            Mặc định là 20. Khi hàng đợi chỉ còn trống dưới 20%, Logback sẽ tự động bỏ qua
+            các log mức thấp (TRACE, DEBUG, INFO) để nhường hàng đợi cho log quan trọng (WARN, ERROR).
+        -->
+        <discardingThreshold>20</discardingThreshold>
+
+        <!-- 
+            neverBlock: THUỘC TÍNH CỐT LÕI ĐỂ KHÔNG BLOCK ỨNG DỤNG CHÍNH
+            - true: Khi hàng đợi bị đầy (buffer full), drop log ngay lập tức và trả quyền điều khiển 
+                    lại cho Worker Thread (Non-blocking). Ứng dụng chính tiếp tục chạy bình thường.
+            - false (mặc định): Luồng Worker Thread bị TREO (BLOCK) chờ hàng đợi có chỗ trống,
+                    khiến toàn bộ luồng xử lý đơn hàng bị đóng băng khi Logstash nghẽn.
+        -->
+        <neverBlock>true</neverBlock>
+
+        <!-- Thời gian tối đa (ms) chờ đẩy hết log trong queue khi ứng dụng dừng (Graceful Shutdown) -->
+        <maxFlushTime>5000</maxFlushTime>
+
+        <!-- Tắt includeCallerData để tăng tốc độ ghi log, tránh tốn CPU cho việc truy vết stacktrace -->
+        <includeCallerData>false</includeCallerData>
+    </appender>
+
+    <!-- Root Logger sử dụng Appender bất đồng bộ ASYNC_LOGSTASH -->
+    <root level="INFO">
+        <appender-ref ref="CONSOLE" />
+        <appender-ref ref="ASYNC_LOGSTASH" />
+    </root>
+
+</configuration>

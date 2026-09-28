@@ -1,212 +1,253 @@
-# BÀI TẬP SESSION 17 (MD5) - BÀI TẬP 3 (HW3)
-## Phân loại và Định tuyến Log theo Index động trên Elasticsearch bằng Logstash
+# BÀI TẬP SESSION 17 (MD5) - BÀI TẬP 4 (HW4)
+## Phân tích và Khắc phục lỗi Lost Log & Nghẽn Hệ thống khi Logstash Quá tải (AsyncAppender Pattern)
 
 ---
 
 ## 1. Mục tiêu kiến thức & Tình huống nghiệp vụ
 
 - **Mục tiêu kiến thức**:
-  - Biết cách sử dụng **biến động (dynamic field references / string interpolation)** trong khối `output` của Logstash để tự động tạo và định tuyến log vào các Index khác nhau cho từng Microservice.
-  - Nắm vững các quy tắc đặt tên Index trong Elasticsearch (bắt buộc viết thường, không chứa ký tự đặc biệt) và cách xử lý tiền xử lý (pre-processing) dữ liệu với filter `mutate`.
+  - Hiểu sâu sắc cơ chế hoạt động của cơ chế hàng đợi (**Queue**) và vùng đệm (**Buffer**) trong kiến trúc logging tập trung.
+  - Phân tích được hiệu ứng sập đổ dây chuyền (**Cascading Failure / Thread Starvation**) khi sử dụng Appender truyền dữ liệu qua mạng dạng đồng bộ.
+  - Nắm vững cách cấu hình **`AsyncAppender`** trong Logback / Spring Boot và hiểu bản chất từng thông số kỹ thuật then chốt (`queueSize`, `neverBlock`, `discardingThreshold`).
+  - Nắm được mô hình kiến trúc mở rộng chuẩn Production sử dụng Message Broker (Kafka/RabbitMQ) làm lớp đệm bền vững.
+
 - **Tình huống nghiệp vụ**:
-  - Hệ thống Microservices gồm nhiều dịch vụ như `user-service`, `order-service`, `payment-service`... cùng gửi log về Logstash.
-  - Cấu hình cũ để cố định `index => "logstash-%{+YYYY.MM.dd}"`, dẫn đến toàn bộ log của tất cả các service bị tống chung vào một index duy nhất.
-  - **Hệ quả tiêu cực**:
-    - Khó phân quyền bảo mật (RBAC): Đội ngũ phụ trách `order-service` không nên xem các thông tin nhạy cảm của `user-service`.
-    - Không thể tối ưu hóa chính sách vòng đời chỉ mục (Index Lifecycle Management - ILM): Mỗi dịch vụ có nhu cầu lưu trữ (retention policy) khác nhau (ví dụ: `order-service` cần lưu 1 năm, `user-service` debug chỉ cần lưu 14 ngày).
-    - Giảm hiệu năng truy vấn khi dung lượng dữ liệu phình to.
-  - Quản trị viên yêu cầu tách riêng từng Index theo tên ứng dụng dựa trên trường `app_name` do ứng dụng Spring Boot (`logback-spring`) gửi kèm trong chuỗi JSON.
+  - Vào sự kiện Flash Sale, hệ thống bán hàng **StoreX** ghi nhận lượng truy cập khổng lồ, phát sinh lưu lượng log lên tới **10.000 dòng log/giây**.
+  - Cụm Logstash tiếp nhận không kịp xử lý dẫn đến nghẽn mạng và chậm phản hồi.
+  - Hệ quả nghiêm trọng: Ứng dụng Backend Spring Boot bị lỗi **Timeout** liên tục, các luồng xử lý đơn hàng bị đóng băng, khách hàng không thể thanh toán, gây gián đoạn và thiệt hại doanh thu trực tiếp cho doanh nghiệp.
 
 ---
 
-## 2. Phân tích giải pháp kỹ thuật
+## 2. Phân tích nguyên nhân gốc rễ (Root Cause Analysis)
 
-### 2.1. Cơ chế nội suy chuỗi biến động (Dynamic Field References) trong Logstash
+### 2.1. Vì sao Appender TCP đồng bộ lại làm chậm và sập toàn bộ ứng dụng chính?
 
-```
-                          [ ĐỊNH TUYẾN INDEX ĐỘNG THEO APP_NAME ]
-
-   user-service  ──[TCP:5000 {"app_name":"user-service",...}]──► ┌──────────┐
-                                                                 │          │ ──► Index: user-service-2026.09.28
-   order-service ──[TCP:5000 {"app_name":"order-service",...}]──► │ LOGSTASH │ ──► Index: order-service-2026.09.28
-                                                                 │          │ ──► Index: unknown-service-2026.09.28 (fallback)
-   other-service ──[TCP:5000 (không có app_name)]───────────────► └──────────┘
+Cấu hình ban đầu của ứng dụng StoreX:
+```xml
+<appender name="LOGSTASH" class="net.logstash.logback.appender.LogstashTcpSocketAppender">
+    <destination>logstash:5000</destination>
+    <encoder class="net.logstash.logback.encoder.LogstashEncoder" />
+</appender>
 ```
 
-- Trong Logstash, cú pháp `%{[tên_trường]}` hoặc `%{tên_trường}` cho phép truy xuất giá trị của trường dữ liệu trong sự kiện log.
-- Cú pháp `%{+YYYY.MM.dd}` định dạng thời gian dựa trên trường `@timestamp` của sự kiện.
-- Bằng cách kết hợp:
-  ```ruby
-  index => "%{[app_name]}-%{+YYYY.MM.dd}"
-  ```
-  Logstash sẽ tự động trích xuất giá trị trường `app_name` của từng bản ghi để sinh tên Index tương ứng trên Elasticsearch theo ngày.
+```
+           [ CƠ CHẾ NGHẼN CỦA ĐỒNG BỘ: HIỆU ỨNG SẬP DÂY CHUYỀN (THREAD STARVATION) ]
 
-### 2.2. Xử lý chuẩn hóa với Filter Mutate
-Elasticsearch quy định rất nghiêm ngặt về định dạng tên Index:
-1. **Chỉ được dùng chữ thường (lowercase)**: Nếu ứng dụng gửi `app_name: "Order-Service"`, Elasticsearch sẽ từ chối tạo index và quăng lỗi `InvalidIndexNameException`.
-2. **Xử lý trường hợp thiếu `app_name`**: Nếu bản ghi log không có `app_name`, cần gán giá trị dự phòng mặc định (fallback) như `unknown-service` để tránh sinh ra tên index lỗi `%{app_name}-...`.
+   Khách hàng gửi Request
+            │
+            ▼
+    ┌────────────────────────────────────────────────────────┐
+    │  TOMCAT THREAD POOL (Giới hạn mặc định: 200 threads)    │
+    │                                                        │
+    │  [Worker Thread 1] ──► Xử lý Đơn hàng                  │
+    │                           │                            │
+    │                           ▼                            │
+    │                     log.info(...)                      │
+    │                           │                            │
+    │                           ▼  (Ghi mạng Socket TCP)     │
+    │                   ┌───────────────┐                    │
+    │                   │ TCP Socket    │                    │
+    │                   │ OS Send Buffer│ ──► [ LOGSTASH ]   │
+    │                   └───────────────┘       (BỊ QUÁ TẢI) │
+    │                           │               (Xử lý chậm) │
+    │                           ▼                            │
+    │             Buffer đầy -> socket.write() BỊ BLOCK      │
+    │             Thread 1 bị TREO vô thời hạn!             │
+    │                                                        │
+    │  [Worker Thread 2] ──► log.info(...) ──► BỊ BLOCK      │
+    │  [Worker Thread 3] ──► log.info(...) ──► BỊ BLOCK      │
+    │  ...                                                   │
+    │  [Worker Thread 200] ─► log.info(...) ──► BỊ BLOCK     │
+    └────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+         CẠN KIỆT TOÀN BỘ WORKER THREAD TRONG THREAD POOL!
+         Hệ thống sập hoàn toàn (504 Gateway Timeout / Drop kết nối)
+         Chỉ vì một dòng lệnh ghi Log!
+```
 
-Khối filter hoàn chỉnh:
-```ruby
-filter {
-  if [app_name] {
-    mutate {
-      lowercase => [ "app_name" ]
-    }
-  } else {
-    mutate {
-      add_field => { "app_name" => "unknown-service" }
-    }
-  }
-}
+### 2.2. Chuỗi sự kiện gây sập hệ thống (Step-by-step Failure Analysis):
+1. **Lưu lượng tăng đột biến**: Vào đợt Sale, hàng ngàn khách hàng thao tác đồng thời tạo ra 10.000 log/s.
+2. **Logstash bị quá tải**: Do tài nguyên CPU, I/O hoặc Elasticsearch ghi chậm, Logstash không kịp đọc dữ liệu từ Socket TCP.
+3. **Tràn bộ đệm TCP (TCP Window Full)**: Bộ đệm socket của hệ điều hành phía máy chủ ứng dụng bị đầy (TCP Zero Window), không thể gửi thêm byte nào qua mạng.
+4. **Luồng chính bị khóa (Thread Blocking)**: Khi gọi `log.info(...)`, luồng xử lý chính (`http-nio-8080-exec-x`) phải đợi phương thức `socket.write()` hoàn tất. Do socket bị nghẽn, luồng này bị treo và chuyển sang trạng thái `BLOCKED` / `WAITING`.
+5. **Cạn kiệt Thread Pool (Thread Pool Exhaustion)**: Web Server (Tomcat) có số lượng thread giới hạn (thường là 200 threads). Từng thread xử lý xong phần logic nghiệp vụ nhưng bị giữ lại ở bước ghi log, dẫn đến toàn bộ 200 threads đều bị treo.
+6. **Sập hệ thống toàn diện**: Các request tiếp theo từ khách hàng không có thread nào phục vụ, dẫn đến lỗi `Connection Refused` hoặc `HTTP 504 Gateway Timeout`.
+
+---
+
+## 3. Giải pháp kỹ thuật: Cơ chế Bất đồng bộ với `AsyncAppender`
+
+### 3.1. Sơ đồ kiến trúc AsyncAppender
+
+```
+             [ KIẾN TRÚC BẤT ĐỒNG BỘ BẢO VỆ LUỒNG CHÍNH (ASYNCAPPENDER) ]
+
+   Khách hàng gửi Request
+            │
+            ▼
+    ┌──────────────────────────────────────────────────────────────┐
+    │  TOMCAT WORKER THREAD                                        │
+    │                                                              │
+    │  1. Xử lý nghiệp vụ thanh toán (Business Logic)              │
+    │  2. log.info(...)                                            │
+    │  3. Đẩy log vào BlockingQueue trong RAM (Chỉ mất vài micro-giây) │
+    │  4. Ngay lập tức giải phóng thread để phục vụ khách khác!    │
+    └──────────────────────────────┬───────────────────────────────┘
+                                   │
+                                   ▼ (Non-blocking enqueue)
+                    ┌──────────────────────────────┐
+                    │     IN-MEMORY RING BUFFER    │
+                    │        (BlockingQueue)       │
+                    │     Dung lượng: 16.384 log   │
+                    └──────────────┬───────────────┘
+                                   │
+                                   ▼ (Background Daemon Thread)
+                    ┌──────────────────────────────┐
+                    │     ASYNC WORKER THREAD      │
+                    │   (Chạy nền ngầm độc lập)   │
+                    │  - Lấy log từ Queue ra       │
+                    │  - Gửi qua TCP tới Logstash  │
+                    └──────────────┬───────────────┘
+                                   │
+                                   ▼ (TCP Socket: 5000)
+                            [ LOGSTASH : 5000 ]
+```
+
+### 3.2. Phân tích chi tiết các thuộc tính cốt lõi của `AsyncAppender`
+
+| Thuộc tính | Giá trị tối ưu | Ý nghĩa kỹ thuật & Tác động thực tế |
+| :--- | :--- | :--- |
+| **`queueSize`** | `16384` hoặc `65536` | Kích thước hàng đợi trong bộ nhớ RAM (mặc định là `256`). Với 10.000 log/s, giá trị 256 sẽ bị đầy trong chưa đầy 0.03 giây. Tăng lên 16384 hoặc 65536 tạo ra vùng đệm đủ lớn để ứng phó với các đợt lưu lượng tăng vọt (traffic spikes). |
+| **`neverBlock`** | **`true`** | **THUỘC TÍNH QUAN TRỌNG NHẤT**: Mặc định là `false` (nghĩa là khi hàng đợi đầy, Worker Thread vẫn sẽ bị BLOCK). Khi cấu hình `neverBlock=true`, nếu hàng đợi bị đầy, Logback sẽ tự động vứt bỏ (DROP) log mới thay vì bắt luồng chính phải chờ. **Quy tắc vàng: Thà mất một vài dòng log chứ tuyệt đối không để sập hệ thống bán hàng.** |
+| **`discardingThreshold`** | `20` | Ngưỡng dung lượng hàng đợi còn trống để bắt đầu loại bỏ log (tính theo %). Khi dung lượng trống < 20%, hệ thống tự động loại bỏ các log mức thấp (`TRACE`, `DEBUG`, `INFO`) để ưu tiên giữ lại các log nghiêm trọng (`WARN`, `ERROR`). |
+| **`includeCallerData`** | `false` | Mặc định là `false`. Tuyệt đối không bật `true` trên môi trường tải cao vì việc trích xuất thông tin Class/Method/Line Number đòi hỏi chi phí StackTrace Inspection rất đắt đỏ về CPU. |
+| **`maxFlushTime`** | `5000` | Thời gian tối đa (ms) cho phép background thread tiếp tục xả hết log còn tồn đọng trong hàng đợi khi ứng dụng tắt (Graceful Shutdown). |
+
+---
+
+## 4. File cấu hình hoàn chỉnh (`logback-spring.xml`)
+
+File cấu hình chi tiết đặt tại `src/main/resources/logback-spring.xml`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration scan="true" scanPeriod="30 seconds">
+
+    <!-- Cấu hình tên ứng dụng -->
+    <springProperty scope="context" name="appName" source="spring.application.name" defaultValue="storex-service"/>
+
+    <!-- 1. Console Appender hiển thị log cục bộ -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!-- 2. TCP Appender gửi log sang Logstash -->
+    <appender name="LOGSTASH" class="net.logstash.logback.appender.LogstashTcpSocketAppender">
+        <destination>logstash:5000</destination>
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+            <customFields>{"app_name":"${appName}"}</customFields>
+        </encoder>
+        <connectionStrategy>
+            <roundRobin>
+                <connectionTimeout>5000</connectionTimeout>
+            </roundRobin>
+        </connectionStrategy>
+    </appender>
+
+    <!-- 3. AsyncAppender: Giải pháp xử lý bất đồng bộ chống nghẽn luồng chính -->
+    <appender name="ASYNC_LOGSTASH" class="ch.qos.logback.classic.AsyncAppender">
+        <!-- Tham chiếu tới Logstash TCP Appender -->
+        <appender-ref ref="LOGSTASH" />
+
+        <!-- 
+            Dung lượng hàng đợi đệm (Queue Size):
+            Mặc định là 256. Với lưu lượng cao (10.000 logs/s), cần tăng kích thước hàng đợi
+            để có đủ không gian đệm khi Logstash gặp độ trễ (ví dụ: 16384 hoặc 65536).
+        -->
+        <queueSize>16384</queueSize>
+
+        <!-- 
+            Ngưỡng loại bỏ log (Discarding Threshold):
+            Mặc định là 20. Khi hàng đợi chỉ còn trống dưới 20%, Logback sẽ tự động bỏ qua
+            các log mức thấp (TRACE, DEBUG, INFO) để nhường hàng đợi cho log quan trọng (WARN, ERROR).
+        -->
+        <discardingThreshold>20</discardingThreshold>
+
+        <!-- 
+            neverBlock: THUỘC TÍNH CỐT LÕI ĐỂ KHÔNG BLOCK ỨNG DỤNG CHÍNH
+            - true: Khi hàng đợi bị đầy (buffer full), drop log ngay lập tức và trả quyền điều khiển 
+                    lại cho Worker Thread (Non-blocking). Ứng dụng chính tiếp tục chạy bình thường.
+            - false (mặc định): Luồng Worker Thread bị TREO (BLOCK) chờ hàng đợi có chỗ trống,
+                    khiến toàn bộ luồng xử lý đơn hàng bị đóng băng khi Logstash nghẽn.
+        -->
+        <neverBlock>true</neverBlock>
+
+        <!-- Thời gian tối đa (ms) chờ đẩy hết log trong queue khi ứng dụng dừng (Graceful Shutdown) -->
+        <maxFlushTime>5000</maxFlushTime>
+
+        <!-- Tắt includeCallerData để tăng tốc độ ghi log, tránh tốn CPU cho việc truy vết stacktrace -->
+        <includeCallerData>false</includeCallerData>
+    </appender>
+
+    <!-- Root Logger sử dụng Appender bất đồng bộ ASYNC_LOGSTASH -->
+    <root level="INFO">
+        <appender-ref ref="CONSOLE" />
+        <appender-ref ref="ASYNC_LOGSTASH" />
+    </root>
+
+</configuration>
 ```
 
 ---
 
-## 3. Cấu hình hoàn chỉnh
+## 5. Kiến trúc đệm mở rộng cho hệ thống quy mô lớn (Enterprise Production)
 
-### 3.1. File cấu hình Logstash (`logstash.conf`)
+Mặc dù `AsyncAppender` với `neverBlock=true` giải quyết triệt để vấn đề nghẽn luồng chính, nhưng việc lưu hàng đợi trong RAM của ứng dụng vẫn có 2 hạn chế:
+1. **Rủi ro mất mát dữ liệu (Data Loss)**: Nếu server bị sập đột ngột (Crash / Out of Memory / Mất điện), số log đang nằm trong RAM chưa kịp gửi sẽ mất vĩnh viễn.
+2. **Giới hạn bộ nhớ RAM**: Nếu hàng đợi quá lớn, ứng dụng sẽ tốn nhiều heap memory và tăng thời gian dừng do Garbage Collection (GC Pause).
 
-```ruby
-input {
-  tcp {
-    port => 5000
-    codec => json_lines
-  }
-}
+### Kiến trúc giải pháp với Message Broker (Kafka Buffer):
 
-filter {
-  # Chuẩn hóa app_name về chữ thường để tuân thủ quy định đặt tên Index của Elasticsearch
-  if [app_name] {
-    mutate {
-      lowercase => [ "app_name" ]
-    }
-  } else {
-    mutate {
-      add_field => { "app_name" => "unknown-service" }
-    }
-  }
-}
+```
+                   [ KIẾN TRÚC LOGGING MỞ RỘNG DOANH NGHIỆP ]
 
-output {
-  elasticsearch {
-    hosts => ["http://elasticsearch:9200"]
-    # Định tuyến động tên index theo từng ứng dụng/service: %{[app_name]}-%{+YYYY.MM.dd}
-    index => "%{[app_name]}-%{+YYYY.MM.dd}"
-  }
-  stdout {
-    codec => rubydebug
-  }
-}
+   ┌──────────────────┐
+   │ Spring Boot Apps │
+   │  (Microservices) │
+   └────────┬─────────┘
+            │  (Đẩy nhanh qua Kafka Producer)
+            ▼
+   ┌──────────────────────────────────────────────┐
+   │             APACHE KAFKA CLUSTER             │
+   │  - Lớp đệm bền vững ghi trực tiếp xuống đĩa │
+   │  - Khả năng chịu tải hàng trăm nghìn log/s   │
+   │  - Lưu trữ dữ liệu an toàn từ 3 đến 7 ngày   │
+   └──────────────────────┬───────────────────────┘
+                          │
+                          ▼ (Pull theo tốc độ xử lý của Consumer)
+                 ┌──────────────────┐
+                 │ LOGSTASH CLUSTER │
+                 └────────┬─────────┘
+                          │
+                          ▼
+                 ┌──────────────────┐
+                 │  ELASTICSEARCH   │
+                 └──────────────────┘
 ```
 
-### 3.2. Cấu hình Docker Compose (`docker-compose.yml`)
-
-```yaml
-services:
-  elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.0
-    container_name: elasticsearch
-    environment:
-      - discovery.type=single-node
-      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
-      - "JDK_JAVA_OPTIONS=-XX:-UseContainerSupport"
-    ports:
-      - "9200:9200"
-      - "9300:9300"
-    networks:
-      - elk-network
-
-  logstash:
-    image: docker.elastic.co/logstash/logstash:7.17.0
-    container_name: logstash
-    ports:
-      - "5000:5000"
-    volumes:
-      - ./logstash.conf:/usr/share/logstash/pipeline/logstash.conf:ro
-    environment:
-      - "LS_JAVA_OPTS=-Xms512m -Xmx512m"
-      - "JDK_JAVA_OPTIONS=-XX:-UseContainerSupport"
-    depends_on:
-      - elasticsearch
-    networks:
-      - elk-network
-
-  kibana:
-    image: docker.elastic.co/kibana/kibana:7.17.0
-    container_name: kibana
-    environment:
-      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
-    ports:
-      - "5601:5601"
-    depends_on:
-      - elasticsearch
-    networks:
-      - elk-network
-
-networks:
-  elk-network:
-    driver: bridge
-```
+- **Nguyên lý hoạt động**:
+  - Ứng dụng Spring Boot đẩy log vào topic `app-logs` của **Kafka** hoặc **RabbitMQ**.
+  - Kafka đóng vai trò như một **bể chứa đệm khổng lồ (Shock Absorber)**, có khả năng lưu trữ hàng triệu log xuống đĩa an toàn.
+  - Logstash hoạt động với tư cách là Kafka Consumer: chủ động kéo log về theo tốc độ xử lý tối đa của nó. Dù Logstash có bị bảo trì hay chậm trong nhiều giờ, ứng dụng chính vẫn hoạt động trơn tru 100% và không có bất kỳ dòng log nào bị mất mát.
 
 ---
 
-## 4. Hướng dẫn khởi chạy & Kiểm thử thực tế
+## 6. Kết luận
 
-### 4.1. Khởi chạy toàn bộ hệ thống
-```bash
-docker compose up -d
-```
-
-### 4.2. Gửi đồng thời luồng log từ hai dịch vụ `user-service` và `order-service`
-Sử dụng script gửi qua cổng TCP 5000:
-
-```powershell
-$client = New-Object System.Net.Sockets.TcpClient("localhost", 5000)
-$stream = $client.GetStream()
-$writer = New-Object System.IO.StreamWriter($stream)
-
-# Gửi log của user-service
-$userLog = '{"app_name":"user-service","level":"INFO","message":"User login successful","userId":"user_001"}'
-$writer.WriteLine($userLog)
-
-# Gửi log của order-service
-$orderLog = '{"app_name":"order-service","level":"INFO","message":"Order created successfully","orderId":"order_999"}'
-$writer.WriteLine($orderLog)
-
-$writer.Flush()
-$client.Close()
-```
-
-### 4.3. Kiểm tra danh sách Index trên Elasticsearch
-Kiểm tra qua API `GET _cat/indices?v`:
-```bash
-curl http://localhost:9200/_cat/indices?v
-```
-
-Kết quả phản hồi trên Elasticsearch hiển thị 2 index độc lập:
-```text
-health status index                           docs.count
-yellow open   order-service-2026.09.28                 1
-yellow open   user-service-2026.09.28                  1
-```
-
-### 4.4. Kiểm tra nội dung document trong từng Index riêng biệt
-- **Truy vấn log `user-service`**:
-  ```bash
-  curl http://localhost:9200/user-service-*/_search?pretty
-  ```
-  *Kết quả trả về*: Bản ghi có `app_name: "user-service"`, `userId: "user_001"`, `message: "User login successful"`.
-
-- **Truy vấn log `order-service`**:
-  ```bash
-  curl http://localhost:9200/order-service-*/_search?pretty
-  ```
-  *Kết quả trả về*: Bản ghi có `app_name: "order-service"`, `orderId: "order_999"`, `message: "Order created successfully"`.
-
----
-
-## 5. Kết luận
-
-- Việc áp dụng biến động `%{[app_name]}-%{+YYYY.MM.dd}` trong Logstash Output giải quyết triệt để bài toán phân loại và cách ly dữ liệu log theo từng service trong kiến trúc Microservices.
-- Hệ thống đảm bảo tính mở rộng cao: khi có thêm bất kỳ dịch vụ mới nào (ví dụ `payment-service`, `inventory-service`), Logstash sẽ tự động sinh Index mới tương ứng mà không cần phải cấu hình lại hay khởi động lại pipeline.
+1. **Nguyên tắc bất di bất dịch trong Thiết kế Hạ tầng**: Tác vụ phụ (như Ghi Log / Metrics / Tracing) **tuyệt đối không bao giờ được phép làm ảnh hưởng hoặc kéo sập luồng xử lý nghiệp vụ chính** của ứng dụng.
+2. Luôn bọc các Network Appender qua **`AsyncAppender`** với thuộc tính **`neverBlock=true`** để đảm bảo tính sẵn sàng cao (**High Availability**) cho toàn hệ thống.
+3. Khi lưu lượng vượt ngưỡng hàng chục nghìn log/s, kiến trúc nên tích hợp thêm **Message Broker (Kafka)** để đảm bảo cả hai tiêu chí: **Không nghẽn ứng dụng** và **Không mất mát log**.
