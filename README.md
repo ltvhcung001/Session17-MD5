@@ -1,70 +1,91 @@
-# BÀI TẬP SESSION 17 (MD5) - BÀI TẬP 1 (HW1)
-## Khắc phục lỗi kết nối giữa Kibana và Elasticsearch trong cụm ELK/EFK Stack
+# BÀI TẬP SESSION 17 (MD5) - BÀI TẬP 2 (HW2)
+## Cấu hình Logstash nhận luồng log JSON từ Spring Boot qua giao thức TCP
 
 ---
 
 ## 1. Mục tiêu kiến thức & Tình huống nghiệp vụ
 
 - **Mục tiêu kiến thức**:
-  - Nắm vững kiến trúc và cách thiết lập các thành phần trong bộ công cụ **Elasticsearch**, **Fluentd/Logstash**, và **Kibana** (EFK / ELK Stack).
-  - Hiểu rõ vai trò của từng cổng mạng (network ports) và giao thức truyền thông trong hệ sinh thái Elastic.
+  - Biết cách cấu hình file `logstash.conf` với đầy đủ 3 khối: `input`, `filter` (tùy chọn), và `output`.
+  - Hiểu cơ chế hoạt động của các Codec trong Logstash, đặc biệt là `codec => json_lines` khi tiếp nhận luồng dữ liệu truyền qua TCP Socket từ ứng dụng (như Spring Boot với thư viện `logstash-logback-encoder`).
+  - Đảm bảo dữ liệu log gửi sang Elasticsearch là **dữ liệu có cấu trúc (Structured Data)** thay vì một chuỗi text thô (Raw String).
+
 - **Tình huống nghiệp vụ**:
-  - Đội ngũ phát triển (Dev team) quyết định ứng dụng ELK/EFK để quản lý và phân tích log tập trung.
-  - Một bạn Dev đã soạn thảo file `docker-compose.yml`, nhưng khi triển khai hệ thống, service Kibana liên tục ghi log cảnh báo lỗi `Elasticsearch is unreachable` và giao diện web hiển thị lỗi `Kibana server is not ready yet`.
+  - Hệ thống Backend **StoreX** (xây dựng bằng Spring Boot) cấu hình Logback (`logstash-logback-encoder`) để bắn log trực tiếp qua TCP Socket tới Logstash ở cổng `5000` dưới định dạng JSON.
+  - Tuy nhiên, file `logstash.conf` ban đầu cấu hình input `tcp` mà không chỉ định codec (hoặc dùng codec `plain` mặc định), dẫn đến việc Logstash không thể parse được các trường JSON hoặc lưu toàn bộ log thành một chuỗi chuỗi string thô trong trường `message`, không phục vụ được nhu cầu tìm kiếm, lọc theo trường (`field filter`) và vẽ biểu đồ phân tích trên Kibana.
 
 ---
 
-## 2. Phân tích nguyên nhân gốc rễ (Root Cause Analysis)
+## 2. Phân tích nguyên nhân gốc rễ & Giải pháp
 
-### 2.1. Bản chất sự khác biệt giữa Port 9200 và Port 9300 của Elasticsearch
-
-Elasticsearch mặc định lắng nghe trên 2 cổng mạng phục vụ hai mục đích hoàn toàn khác nhau:
-
-| Tiêu chí | Cổng 9200 (HTTP REST API) | Cổng 9300 (Transport Protocol) |
-| :--- | :--- | :--- |
-| **Giao thức** | HTTP / HTTPS (JSON payload) | Giao thức nhị phân Java nội bộ (Binary TCP) |
-| **Mục đích sử dụng** | Cổng giao tiếp chuẩn RESTful API | Giao tiếp nội bộ giữa các node trong cụm (Node-to-Node, Clustering) |
-| **Đối tượng kết nối** | **Kibana**, Logstash, Fluentd, Trình duyệt web, REST Client (Postman, Curl), Ứng dụng Backend | Các Elasticsearch Node khác trong Cluster, Java Transport Client (legacy) |
+### 2.1. Phân tích nguyên nhân lỗi (Root Cause Analysis)
 
 ```
-                                  [ KIẾN TRÚC KẾT NỐI ELK ]
+                            [ LUỒNG LOG TỪ STOREX QUA LOGSTASH VÀO ELASTICSEARCH ]
 
-   Trình duyệt (Browser)
+   Spring Boot (StoreX)
+   Logback TCP Appender
             │
-            ▼ (HTTP - Port 5601)
-     ┌──────────────┐
-     │    KIBANA    │
-     └──────┬───────┘
+            ▼ (JSON Stream qua TCP:5000)
+    ┌───────────────┐
+    │   LOGSTASH    │
+    │  input { tcp }│
+    └───────┬───────┘
             │
-            │  [X] SAI: http://elasticsearch:9300 (Gửi HTTP vào cổng Binary TCP -> Lỗi)
-            │  [v] ĐÚNG: http://elasticsearch:9200 (Gửi HTTP REST API vào cổng HTTP)
-            ▼
-     ┌──────────────┐
-     │ELASTICSEARCH │◄── (Cổng 9300: Dành riêng node-to-node cluster giao tiếp nhị phân)
-     └──────────────┘
+            ├─ [X] codec => plain (mặc định)
+            │      -> Lưu nguyên cục: { message: "{\"app\":\"StoreX\",\"level\":\"INFO\"...}" }
+            │      -> Không thể filter, query theo từng field riêng biệt!
+            │
+            └─ [v] codec => json_lines
+                   -> Tự động tách từng dòng và parse JSON thành fields:
+                      { "app": "StoreX", "level": "INFO", "orderId": 1001, ... }
+                      
+            ▼ (Gửi sang Elasticsearch)
+    ┌───────────────┐
+    │ ELASTICSEARCH │ (Lập chỉ mục các trường có kiểu dữ liệu rõ ràng: string, number, date)
+    └───────────────┘
 ```
 
-### 2.2. Lý do phát sinh lỗi trong cấu hình ban đầu
-- Trong cấu hình ban đầu, biến môi trường của Kibana được khai báo:
-  ```yaml
-  ELASTICSEARCH_HOSTS=http://elasticsearch:9300
-  ```
-- Kibana sử dụng HTTP client để gửi các truy vấn REST API đến cổng `9300`. Vì cổng `9300` của Elasticsearch chỉ hiểu giao thức nhị phân Transport thay vì HTTP, yêu cầu của Kibana bị từ chối hoặc không phản hồi đúng định dạng HTTP.
-- Hậu quả: Kibana không thể khởi tạo kết nối (handshake) với Elasticsearch, liên tục cảnh báo `Elasticsearch is unreachable`, chuyển sang trạng thái chờ và hiển thị lỗi `Kibana server is not ready yet` khi người dùng truy cập.
+1. **Hành vi mặc định của Logstash TCP Input**:
+   - Khi cấu hình `input { tcp { port => 5000 } }` mà không khai báo codec, Logstash sử dụng codec mặc định là `line` hoặc `plain`.
+   - Mỗi chuỗi byte gửi qua socket chỉ được đọc vào dưới dạng text thô và gán vào trường `message`. Toàn bộ cấu trúc key-value của log JSON bị mất, biến thành string thuần túy.
 
-### 2.3. Các điểm cần hoàn thiện bổ sung
-1. **Sửa biến môi trường kết nối**: Đổi `ELASTICSEARCH_HOSTS` thành `http://elasticsearch:9200`.
-2. **Ánh xạ cổng máy host (Port Mapping)**:
-   - Service `kibana`: Mở cổng `5601:5601` để truy cập dashboard từ máy host (`http://localhost:5601`).
-   - Service `elasticsearch`: Mở cổng `9200:9200` để kiểm tra trạng thái cluster và phục vụ truy vấn HTTP từ máy host.
-3. **Quản lý bộ nhớ Heap & Tương thích Kernel (ES_JAVA_OPTS & JDK_JAVA_OPTIONS)**:
-   - Thiết lập `ES_JAVA_OPTS=-Xms512m -Xmx512m` giúp Elasticsearch hoạt động ổn định, tránh chiếm dụng quá nhiều RAM trên môi trường phát triển cục bộ.
-   - Thêm `JDK_JAVA_OPTIONS=-XX:-UseContainerSupport` để xử lý triệt để lỗi NPE cgroup v2 của JVM trên các nhân Linux/Docker hiện đại.
-4. **Phụ thuộc khởi động (depends_on)**: Đảm bảo Kibana khởi tạo sau khi Elasticsearch được tạo.
+2. **Tại sao phải là `json_lines` thay vì `json`?**
+   - Ứng dụng Backend gửi log qua kết nối TCP dạng liên tục (Streaming Socket / Keep-Alive connection), trong đó mỗi bản ghi log kết thúc bằng ký tự xuống dòng `\n` (NDJSON - Newline Delimited JSON).
+   - Codec `json` thông thường chờ nhận hết luồng dữ liệu (hoặc đóng socket) mới parse, dẫn đến treo hoặc parse lỗi khi kết nối TCP duy trì lâu dài.
+   - Codec `json_lines` được thiết kế chuyên biệt cho TCP Stream: tự động tách từng dòng theo `\n` và parse ngay lập tức từng bản ghi JSON thành các document có cấu trúc.
 
 ---
 
-## 3. Cấu hình Docker Compose hoàn chỉnh (`docker-compose.yml`)
+## 3. Cấu hình chi tiết
+
+### 3.1. File cấu hình Logstash (`logstash.conf`)
+
+Đã sửa đổi input bằng việc thêm `codec => json_lines`:
+
+```ruby
+input {
+  tcp {
+    port => 5000
+    # Sửa lỗi: Bổ sung codec json_lines để Logstash tự động phân tách theo từng dòng và parse JSON
+    codec => json_lines
+  }
+}
+
+output {
+  elasticsearch {
+    hosts => ["http://elasticsearch:9200"]
+    index => "storex-logs-%{+YYYY.MM.dd}"
+  }
+  stdout {
+    codec => rubydebug
+  }
+}
+```
+
+### 3.2. Cấu hình Docker Compose (`docker-compose.yml`)
+
+Bổ sung service `logstash` đồng bộ với cụm Elasticsearch và Kibana:
 
 ```yaml
 services:
@@ -81,11 +102,25 @@ services:
     networks:
       - elk-network
 
+  logstash:
+    image: docker.elastic.co/logstash/logstash:7.17.0
+    container_name: logstash
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./logstash.conf:/usr/share/logstash/pipeline/logstash.conf:ro
+    environment:
+      - "LS_JAVA_OPTS=-Xms512m -Xmx512m"
+      - "JDK_JAVA_OPTIONS=-XX:-UseContainerSupport"
+    depends_on:
+      - elasticsearch
+    networks:
+      - elk-network
+
   kibana:
     image: docker.elastic.co/kibana/kibana:7.17.0
     container_name: kibana
     environment:
-      # Sửa cổng kết nối từ 9300 (transport) về đúng cổng 9200 (HTTP REST API)
       - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
     ports:
       - "5601:5601"
@@ -101,33 +136,43 @@ networks:
 
 ---
 
-## 4. Hướng dẫn khởi chạy & Kiểm tra kết quả
+## 4. Hướng dẫn khởi chạy & Kiểm thử thực tế
 
-### 4.1. Khởi chạy hệ sinh thái
-Mở terminal tại thư mục chứa file `docker-compose.yml` và chạy:
+### 4.1. Khởi động toàn bộ cụm dịch vụ
 ```bash
 docker compose up -d
 ```
 
-### 4.2. Kiểm tra trạng thái của các container
-```bash
-docker compose ps
+### 4.2. Gửi log JSON mẫu qua cổng TCP 5000
+Có thể sử dụng PowerShell để gửi gói tin log có cấu trúc vào cổng 5000:
+
+```powershell
+$client = New-Object System.Net.Sockets.TcpClient("localhost", 5000)
+$stream = $client.GetStream()
+$writer = New-Object System.IO.StreamWriter($stream)
+$writer.WriteLine('{"app":"StoreX","level":"INFO","logger":"com.storex.service.OrderService","orderId":"ORD-9988","amount":150.75,"message":"Payment processed successfully"}')
+$writer.Flush()
+$client.Close()
 ```
 
-### 4.3. Kiểm tra Elasticsearch REST API
-Truy cập trực tiếp từ máy host:
+### 4.3. Kiểm tra kết quả trong Elasticsearch
+Truy vấn các bản ghi log trong index `storex-logs-*`:
 ```bash
-curl http://localhost:9200
+curl http://localhost:9200/storex-logs-*/_search?pretty
 ```
-Phản hồi thành công sẽ trả về JSON chứa thông tin cụm, phiên bản Elasticsearch (`7.17.0`) và khẩu hiệu `"You Know, for Search"`.
 
-### 4.4. Kiểm tra giao diện người dùng Kibana
-- Truy cập trình duyệt tại địa chỉ: `http://localhost:5601`
-- Kết quả mong muốn: Giao diện Kibana tải thành công, không gặp cảnh báo `Elasticsearch is unreachable` hay lỗi `server is not ready yet`.
+Kết quả phản hồi xác nhận Logstash đã parse thành công từng trường JSON riêng biệt:
+- Trường `app`: `"StoreX"`
+- Trường `level`: `"INFO"`
+- Trường `orderId`: `"ORD-9988"`
+- Trường `amount`: `150.75` (dạng number)
+- Trường `message`: `"Payment processed successfully"`
+
+Thay vì lưu toàn bộ chuỗi JSON vào một field `message` thô, dữ liệu đã được bóc tách có cấu trúc hoàn chỉnh.
 
 ---
 
 ## 5. Kết luận
 
-- Việc phân định rõ giữa **Cổng REST API (9200)** và **Cổng Transport (9300)** là nguyên lý cơ bản và quan trọng khi thiết lập cụm Elasticsearch cũng như tích hợp các dịch vụ vệ tinh (Kibana, Logstash, Fluentd, Beat agents).
-- Sau khi cấu hình đúng `ELASTICSEARCH_HOSTS=http://elasticsearch:9200` và ánh xạ cổng `5601:5601`, Kibana kết nối liền mạch tới Elasticsearch, hệ thống sẵn sàng cho việc thu thập và trực quan hóa log.
+- Việc sử dụng `codec => json_lines` trên `tcp` input là giải pháp tối ưu và bắt buộc khi nhận log dạng streaming JSON từ các ứng dụng Java / Spring Boot.
+- Logstash hoàn thành nhiệm vụ phân giải (parsing) trực tiếp tại tầng input, giúp Elasticsearch lập chỉ mục chính xác từng trường dữ liệu, tối ưu hóa hiệu năng truy vấn và phân tích trên Kibana Dashboard.
