@@ -1,81 +1,98 @@
-# BÀI TẬP SESSION 17 (MD5) - BÀI TẬP 2 (HW2)
-## Cấu hình Logstash nhận luồng log JSON từ Spring Boot qua giao thức TCP
+# BÀI TẬP SESSION 17 (MD5) - BÀI TẬP 3 (HW3)
+## Phân loại và Định tuyến Log theo Index động trên Elasticsearch bằng Logstash
 
 ---
 
 ## 1. Mục tiêu kiến thức & Tình huống nghiệp vụ
 
 - **Mục tiêu kiến thức**:
-  - Biết cách cấu hình file `logstash.conf` với đầy đủ 3 khối: `input`, `filter` (tùy chọn), và `output`.
-  - Hiểu cơ chế hoạt động của các Codec trong Logstash, đặc biệt là `codec => json_lines` khi tiếp nhận luồng dữ liệu truyền qua TCP Socket từ ứng dụng (như Spring Boot với thư viện `logstash-logback-encoder`).
-  - Đảm bảo dữ liệu log gửi sang Elasticsearch là **dữ liệu có cấu trúc (Structured Data)** thay vì một chuỗi text thô (Raw String).
-
+  - Biết cách sử dụng **biến động (dynamic field references / string interpolation)** trong khối `output` của Logstash để tự động tạo và định tuyến log vào các Index khác nhau cho từng Microservice.
+  - Nắm vững các quy tắc đặt tên Index trong Elasticsearch (bắt buộc viết thường, không chứa ký tự đặc biệt) và cách xử lý tiền xử lý (pre-processing) dữ liệu với filter `mutate`.
 - **Tình huống nghiệp vụ**:
-  - Hệ thống Backend **StoreX** (xây dựng bằng Spring Boot) cấu hình Logback (`logstash-logback-encoder`) để bắn log trực tiếp qua TCP Socket tới Logstash ở cổng `5000` dưới định dạng JSON.
-  - Tuy nhiên, file `logstash.conf` ban đầu cấu hình input `tcp` mà không chỉ định codec (hoặc dùng codec `plain` mặc định), dẫn đến việc Logstash không thể parse được các trường JSON hoặc lưu toàn bộ log thành một chuỗi chuỗi string thô trong trường `message`, không phục vụ được nhu cầu tìm kiếm, lọc theo trường (`field filter`) và vẽ biểu đồ phân tích trên Kibana.
+  - Hệ thống Microservices gồm nhiều dịch vụ như `user-service`, `order-service`, `payment-service`... cùng gửi log về Logstash.
+  - Cấu hình cũ để cố định `index => "logstash-%{+YYYY.MM.dd}"`, dẫn đến toàn bộ log của tất cả các service bị tống chung vào một index duy nhất.
+  - **Hệ quả tiêu cực**:
+    - Khó phân quyền bảo mật (RBAC): Đội ngũ phụ trách `order-service` không nên xem các thông tin nhạy cảm của `user-service`.
+    - Không thể tối ưu hóa chính sách vòng đời chỉ mục (Index Lifecycle Management - ILM): Mỗi dịch vụ có nhu cầu lưu trữ (retention policy) khác nhau (ví dụ: `order-service` cần lưu 1 năm, `user-service` debug chỉ cần lưu 14 ngày).
+    - Giảm hiệu năng truy vấn khi dung lượng dữ liệu phình to.
+  - Quản trị viên yêu cầu tách riêng từng Index theo tên ứng dụng dựa trên trường `app_name` do ứng dụng Spring Boot (`logback-spring`) gửi kèm trong chuỗi JSON.
 
 ---
 
-## 2. Phân tích nguyên nhân gốc rễ & Giải pháp
+## 2. Phân tích giải pháp kỹ thuật
 
-### 2.1. Phân tích nguyên nhân lỗi (Root Cause Analysis)
+### 2.1. Cơ chế nội suy chuỗi biến động (Dynamic Field References) trong Logstash
 
 ```
-                            [ LUỒNG LOG TỪ STOREX QUA LOGSTASH VÀO ELASTICSEARCH ]
+                          [ ĐỊNH TUYẾN INDEX ĐỘNG THEO APP_NAME ]
 
-   Spring Boot (StoreX)
-   Logback TCP Appender
-            │
-            ▼ (JSON Stream qua TCP:5000)
-    ┌───────────────┐
-    │   LOGSTASH    │
-    │  input { tcp }│
-    └───────┬───────┘
-            │
-            ├─ [X] codec => plain (mặc định)
-            │      -> Lưu nguyên cục: { message: "{\"app\":\"StoreX\",\"level\":\"INFO\"...}" }
-            │      -> Không thể filter, query theo từng field riêng biệt!
-            │
-            └─ [v] codec => json_lines
-                   -> Tự động tách từng dòng và parse JSON thành fields:
-                      { "app": "StoreX", "level": "INFO", "orderId": 1001, ... }
-                      
-            ▼ (Gửi sang Elasticsearch)
-    ┌───────────────┐
-    │ ELASTICSEARCH │ (Lập chỉ mục các trường có kiểu dữ liệu rõ ràng: string, number, date)
-    └───────────────┘
+   user-service  ──[TCP:5000 {"app_name":"user-service",...}]──► ┌──────────┐
+                                                                 │          │ ──► Index: user-service-2026.09.28
+   order-service ──[TCP:5000 {"app_name":"order-service",...}]──► │ LOGSTASH │ ──► Index: order-service-2026.09.28
+                                                                 │          │ ──► Index: unknown-service-2026.09.28 (fallback)
+   other-service ──[TCP:5000 (không có app_name)]───────────────► └──────────┘
 ```
 
-1. **Hành vi mặc định của Logstash TCP Input**:
-   - Khi cấu hình `input { tcp { port => 5000 } }` mà không khai báo codec, Logstash sử dụng codec mặc định là `line` hoặc `plain`.
-   - Mỗi chuỗi byte gửi qua socket chỉ được đọc vào dưới dạng text thô và gán vào trường `message`. Toàn bộ cấu trúc key-value của log JSON bị mất, biến thành string thuần túy.
+- Trong Logstash, cú pháp `%{[tên_trường]}` hoặc `%{tên_trường}` cho phép truy xuất giá trị của trường dữ liệu trong sự kiện log.
+- Cú pháp `%{+YYYY.MM.dd}` định dạng thời gian dựa trên trường `@timestamp` của sự kiện.
+- Bằng cách kết hợp:
+  ```ruby
+  index => "%{[app_name]}-%{+YYYY.MM.dd}"
+  ```
+  Logstash sẽ tự động trích xuất giá trị trường `app_name` của từng bản ghi để sinh tên Index tương ứng trên Elasticsearch theo ngày.
 
-2. **Tại sao phải là `json_lines` thay vì `json`?**
-   - Ứng dụng Backend gửi log qua kết nối TCP dạng liên tục (Streaming Socket / Keep-Alive connection), trong đó mỗi bản ghi log kết thúc bằng ký tự xuống dòng `\n` (NDJSON - Newline Delimited JSON).
-   - Codec `json` thông thường chờ nhận hết luồng dữ liệu (hoặc đóng socket) mới parse, dẫn đến treo hoặc parse lỗi khi kết nối TCP duy trì lâu dài.
-   - Codec `json_lines` được thiết kế chuyên biệt cho TCP Stream: tự động tách từng dòng theo `\n` và parse ngay lập tức từng bản ghi JSON thành các document có cấu trúc.
+### 2.2. Xử lý chuẩn hóa với Filter Mutate
+Elasticsearch quy định rất nghiêm ngặt về định dạng tên Index:
+1. **Chỉ được dùng chữ thường (lowercase)**: Nếu ứng dụng gửi `app_name: "Order-Service"`, Elasticsearch sẽ từ chối tạo index và quăng lỗi `InvalidIndexNameException`.
+2. **Xử lý trường hợp thiếu `app_name`**: Nếu bản ghi log không có `app_name`, cần gán giá trị dự phòng mặc định (fallback) như `unknown-service` để tránh sinh ra tên index lỗi `%{app_name}-...`.
+
+Khối filter hoàn chỉnh:
+```ruby
+filter {
+  if [app_name] {
+    mutate {
+      lowercase => [ "app_name" ]
+    }
+  } else {
+    mutate {
+      add_field => { "app_name" => "unknown-service" }
+    }
+  }
+}
+```
 
 ---
 
-## 3. Cấu hình chi tiết
+## 3. Cấu hình hoàn chỉnh
 
 ### 3.1. File cấu hình Logstash (`logstash.conf`)
-
-Đã sửa đổi input bằng việc thêm `codec => json_lines`:
 
 ```ruby
 input {
   tcp {
     port => 5000
-    # Sửa lỗi: Bổ sung codec json_lines để Logstash tự động phân tách theo từng dòng và parse JSON
     codec => json_lines
+  }
+}
+
+filter {
+  # Chuẩn hóa app_name về chữ thường để tuân thủ quy định đặt tên Index của Elasticsearch
+  if [app_name] {
+    mutate {
+      lowercase => [ "app_name" ]
+    }
+  } else {
+    mutate {
+      add_field => { "app_name" => "unknown-service" }
+    }
   }
 }
 
 output {
   elasticsearch {
     hosts => ["http://elasticsearch:9200"]
-    index => "storex-logs-%{+YYYY.MM.dd}"
+    # Định tuyến động tên index theo từng ứng dụng/service: %{[app_name]}-%{+YYYY.MM.dd}
+    index => "%{[app_name]}-%{+YYYY.MM.dd}"
   }
   stdout {
     codec => rubydebug
@@ -84,8 +101,6 @@ output {
 ```
 
 ### 3.2. Cấu hình Docker Compose (`docker-compose.yml`)
-
-Bổ sung service `logstash` đồng bộ với cụm Elasticsearch và Kibana:
 
 ```yaml
 services:
@@ -138,41 +153,60 @@ networks:
 
 ## 4. Hướng dẫn khởi chạy & Kiểm thử thực tế
 
-### 4.1. Khởi động toàn bộ cụm dịch vụ
+### 4.1. Khởi chạy toàn bộ hệ thống
 ```bash
 docker compose up -d
 ```
 
-### 4.2. Gửi log JSON mẫu qua cổng TCP 5000
-Có thể sử dụng PowerShell để gửi gói tin log có cấu trúc vào cổng 5000:
+### 4.2. Gửi đồng thời luồng log từ hai dịch vụ `user-service` và `order-service`
+Sử dụng script gửi qua cổng TCP 5000:
 
 ```powershell
 $client = New-Object System.Net.Sockets.TcpClient("localhost", 5000)
 $stream = $client.GetStream()
 $writer = New-Object System.IO.StreamWriter($stream)
-$writer.WriteLine('{"app":"StoreX","level":"INFO","logger":"com.storex.service.OrderService","orderId":"ORD-9988","amount":150.75,"message":"Payment processed successfully"}')
+
+# Gửi log của user-service
+$userLog = '{"app_name":"user-service","level":"INFO","message":"User login successful","userId":"user_001"}'
+$writer.WriteLine($userLog)
+
+# Gửi log của order-service
+$orderLog = '{"app_name":"order-service","level":"INFO","message":"Order created successfully","orderId":"order_999"}'
+$writer.WriteLine($orderLog)
+
 $writer.Flush()
 $client.Close()
 ```
 
-### 4.3. Kiểm tra kết quả trong Elasticsearch
-Truy vấn các bản ghi log trong index `storex-logs-*`:
+### 4.3. Kiểm tra danh sách Index trên Elasticsearch
+Kiểm tra qua API `GET _cat/indices?v`:
 ```bash
-curl http://localhost:9200/storex-logs-*/_search?pretty
+curl http://localhost:9200/_cat/indices?v
 ```
 
-Kết quả phản hồi xác nhận Logstash đã parse thành công từng trường JSON riêng biệt:
-- Trường `app`: `"StoreX"`
-- Trường `level`: `"INFO"`
-- Trường `orderId`: `"ORD-9988"`
-- Trường `amount`: `150.75` (dạng number)
-- Trường `message`: `"Payment processed successfully"`
+Kết quả phản hồi trên Elasticsearch hiển thị 2 index độc lập:
+```text
+health status index                           docs.count
+yellow open   order-service-2026.09.28                 1
+yellow open   user-service-2026.09.28                  1
+```
 
-Thay vì lưu toàn bộ chuỗi JSON vào một field `message` thô, dữ liệu đã được bóc tách có cấu trúc hoàn chỉnh.
+### 4.4. Kiểm tra nội dung document trong từng Index riêng biệt
+- **Truy vấn log `user-service`**:
+  ```bash
+  curl http://localhost:9200/user-service-*/_search?pretty
+  ```
+  *Kết quả trả về*: Bản ghi có `app_name: "user-service"`, `userId: "user_001"`, `message: "User login successful"`.
+
+- **Truy vấn log `order-service`**:
+  ```bash
+  curl http://localhost:9200/order-service-*/_search?pretty
+  ```
+  *Kết quả trả về*: Bản ghi có `app_name: "order-service"`, `orderId: "order_999"`, `message: "Order created successfully"`.
 
 ---
 
 ## 5. Kết luận
 
-- Việc sử dụng `codec => json_lines` trên `tcp` input là giải pháp tối ưu và bắt buộc khi nhận log dạng streaming JSON từ các ứng dụng Java / Spring Boot.
-- Logstash hoàn thành nhiệm vụ phân giải (parsing) trực tiếp tại tầng input, giúp Elasticsearch lập chỉ mục chính xác từng trường dữ liệu, tối ưu hóa hiệu năng truy vấn và phân tích trên Kibana Dashboard.
+- Việc áp dụng biến động `%{[app_name]}-%{+YYYY.MM.dd}` trong Logstash Output giải quyết triệt để bài toán phân loại và cách ly dữ liệu log theo từng service trong kiến trúc Microservices.
+- Hệ thống đảm bảo tính mở rộng cao: khi có thêm bất kỳ dịch vụ mới nào (ví dụ `payment-service`, `inventory-service`), Logstash sẽ tự động sinh Index mới tương ứng mà không cần phải cấu hình lại hay khởi động lại pipeline.
